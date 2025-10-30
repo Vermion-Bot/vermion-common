@@ -28,20 +28,18 @@ class ConfigManager:
                 
                 if resp.status == 200:
                     data = await resp.json()
-                    logger.debug(f"✅ Config loaded for guild {guild_id}")
+                    logger.debug(f"✅ Config betöltve: {guild_id}")
                     return data
                 elif resp.status == 404:
-                    logger.warning(f"⚠️ Config not found for guild {guild_id}")
+                    logger.warning(f"⚠️ Config nem található: {guild_id}")
                     return None
                 else:
                     logger.error(f"❌ API error: {resp.status}")
                     return None
         
         except aiohttp.ClientError as e:
-            logger.error(f"❌ Network error: {e}")
             return None
         except Exception as e:
-            logger.error(f"❌ Unexpected error: {e}")
             return None
     
     async def get_config(self, guild_id: int) -> Optional[Dict]:
@@ -77,10 +75,12 @@ class ConfigManager:
     
     async def get_bool(self, guild_id: int, key: str, default: bool = False) -> bool:
         value = await self.get_value(guild_id, key, default)
+
         if isinstance(value, bool):
             return value
         if isinstance(value, str):
-            return value.lower() in ("true", "1", "yes", "on")
+            return value.lower() in "true"
+        
         return bool(value) if value is not None else default
     
     async def get_list(self, guild_id: int, key: str, default: list = None) -> list:
