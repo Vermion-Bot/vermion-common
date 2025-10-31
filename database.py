@@ -3,6 +3,7 @@ from psycopg2 import pool
 from datetime import datetime, timedelta, timezone
 import uuid
 import threading
+import secrets
 
 class DatabaseManager:
     _instance = None
@@ -49,17 +50,50 @@ class DatabaseManager:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             
-            CREATE TABLE IF NOT EXISTS config_tokens (
-                token VARCHAR(255) PRIMARY KEY,
-                guild_id BIGINT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                session_id VARCHAR(64) PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                username VARCHAR(255) NOT NULL,
+                discriminator VARCHAR(10),
+                avatar VARCHAR(255),
+                access_token TEXT NOT NULL,
+                refresh_token TEXT,
+                token_type VARCHAR(50),
                 expires_at TIMESTAMP NOT NULL,
-                used BOOLEAN DEFAULT FALSE,
-                used_at TIMESTAMP DEFAULT NULL
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             
-            CREATE INDEX IF NOT EXISTS idx_token_guild 
-            ON config_tokens(guild_id, used, expires_at);
+            CREATE TABLE IF NOT EXISTS user_guilds (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                guild_id BIGINT NOT NULL,
+                guild_name VARCHAR(255),
+                guild_icon VARCHAR(255),
+                owner BOOLEAN DEFAULT FALSE,
+                permissions BIGINT,
+                synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, guild_id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                guild_id BIGINT NOT NULL,
+                action VARCHAR(100) NOT NULL,
+                details TEXT,
+                ip_address VARCHAR(45),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_sessions_user 
+            ON user_sessions(user_id, expires_at);
+            
+            CREATE INDEX IF NOT EXISTS idx_guilds_user 
+            ON user_guilds(user_id, owner);
+            
+            CREATE INDEX IF NOT EXISTS idx_audit_guild 
+            ON audit_logs(guild_id, created_at);
             """
 
             with conn.cursor() as cursor:
@@ -70,95 +104,201 @@ class DatabaseManager:
         finally:
             self._return_connection(conn)
     
-    def generate_config_token(self, guild_id, expires_in_minutes=5):
-        token = str(uuid.uuid4())
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=expires_in_minutes)
+    def create_session(self, user_data, token_data):
+        session_id = secrets.token_urlsafe(48)
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=token_data.get('expires_in', 604800))
+        
         conn = self._get_connection()
-
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    INSERT INTO config_tokens (token, guild_id, expires_at)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (token) DO NOTHING
-                """, (token, guild_id, expires_at))
-
+                    INSERT INTO user_sessions 
+                    (session_id, user_id, username, discriminator, avatar, 
+                     access_token, refresh_token, token_type, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (session_id) DO UPDATE SET
+                        access_token = EXCLUDED.access_token,
+                        expires_at = EXCLUDED.expires_at,
+                        last_activity = CURRENT_TIMESTAMP
+                    RETURNING session_id
+                """, (
+                    session_id,
+                    int(user_data['id']),
+                    user_data['username'],
+                    user_data.get('discriminator', '0'),
+                    user_data.get('avatar'),
+                    token_data['access_token'],
+                    token_data.get('refresh_token'),
+                    token_data.get('token_type', 'Bearer'),
+                    expires_at
+                ))
                 conn.commit()
-            return token
+                return session_id
         except Exception as e:
-            print(f"❌ Hiba a token generálása során: {e}")
+            print(f"❌ Hiba a session létrehozása során: {e}")
             return None
         finally:
             self._return_connection(conn)
     
-    def check_token_valid(self, token, guild_id):
+    def get_session(self, session_id):
         conn = self._get_connection()
-
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT token FROM config_tokens 
-                    WHERE token = %s 
-                    AND guild_id = %s 
-                    AND expires_at > CURRENT_TIMESTAMP 
-                    AND used = FALSE
-                """, (token, guild_id))
-
+                    SELECT user_id, username, discriminator, avatar, access_token, 
+                           token_type, expires_at
+                    FROM user_sessions 
+                    WHERE session_id = %s 
+                    AND expires_at > CURRENT_TIMESTAMP
+                """, (session_id,))
+                
                 result = cursor.fetchone()
-                
                 if result:
-                    return True
-                else:
-                    return False
-                
+                    cursor.execute("""
+                        UPDATE user_sessions 
+                        SET last_activity = CURRENT_TIMESTAMP 
+                        WHERE session_id = %s
+                    """, (session_id,))
+                    conn.commit()
+                    
+                    return {
+                        'user_id': result[0],
+                        'username': result[1],
+                        'discriminator': result[2],
+                        'avatar': result[3],
+                        'access_token': result[4],
+                        'token_type': result[5],
+                        'expires_at': result[6]
+                    }
+                return None
         except Exception as e:
-            print(f"❌ Hiba a token ellenőrzése során: {e}")
+            print(f"❌ Hiba a session lekérése során: {e}")
+            return None
+        finally:
+            self._return_connection(conn)
+    
+    def delete_session(self, session_id):
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM user_sessions WHERE session_id = %s", (session_id,))
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"❌ Hiba a session törlése során: {e}")
             return False
         finally:
             self._return_connection(conn)
     
-    def validate_and_use_token(self, token, guild_id):
+    def sync_user_guilds(self, user_id, guilds_data):
         conn = self._get_connection()
-
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM user_guilds WHERE user_id = %s", (user_id,))
+                
+                for guild in guilds_data:
+                    cursor.execute("""
+                        INSERT INTO user_guilds 
+                        (user_id, guild_id, guild_name, guild_icon, owner, permissions)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        user_id,
+                        int(guild['id']),
+                        guild['name'],
+                        guild.get('icon'),
+                        guild.get('owner', False),
+                        int(guild.get('permissions', 0))
+                    ))
+                
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"❌ Hiba a guilds szinkronizálása során: {e}")
+            return False
+        finally:
+            self._return_connection(conn)
+    
+    def get_user_guilds(self, user_id, manageable_only=True):
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                if manageable_only:
+                    cursor.execute("""
+                        SELECT guild_id, guild_name, guild_icon, owner, permissions
+                        FROM user_guilds 
+                        WHERE user_id = %s 
+                        AND (owner = TRUE OR (permissions & 32) = 32)
+                        ORDER BY guild_name
+                    """, (user_id,))
+                else:
+                    cursor.execute("""
+                        SELECT guild_id, guild_name, guild_icon, owner, permissions
+                        FROM user_guilds 
+                        WHERE user_id = %s
+                        ORDER BY guild_name
+                    """, (user_id,))
+                
+                results = cursor.fetchall()
+                return [{
+                    'guild_id': r[0],
+                    'guild_name': r[1],
+                    'guild_icon': r[2],
+                    'owner': r[3],
+                    'permissions': r[4]
+                } for r in results]
+        except Exception as e:
+            print(f"❌ Hiba a guilds lekérése során: {e}")
+            return []
+        finally:
+            self._return_connection(conn)
+    
+    def check_user_guild_permission(self, user_id, guild_id):
+        conn = self._get_connection()
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    UPDATE config_tokens 
-                    SET used = TRUE, used_at = CURRENT_TIMESTAMP 
-                    WHERE token = %s 
-                    AND guild_id = %s 
-                    AND expires_at > CURRENT_TIMESTAMP 
-                    AND used = FALSE
-                    RETURNING token
-                """, (token, guild_id))
-
+                    SELECT owner, permissions
+                    FROM user_guilds 
+                    WHERE user_id = %s AND guild_id = %s
+                """, (user_id, guild_id))
+                
                 result = cursor.fetchone()
-                conn.commit()
-                
                 if result:
-                    return True
-                else:
-                    return False
-                
+                    owner, permissions = result
+                    return owner or (permissions & 32) == 32
+                return False
         except Exception as e:
-            print(f"❌ Hiba a token validálása során: {e}")
+            print(f"❌ Hiba a permission ellenőrzés során: {e}")
+            return False
+        finally:
+            self._return_connection(conn)
+    
+    def log_action(self, user_id, guild_id, action, details=None, ip_address=None):
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO audit_logs (user_id, guild_id, action, details, ip_address)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (user_id, guild_id, action, details, ip_address))
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"❌ Hiba az audit log írása során: {e}")
             return False
         finally:
             self._return_connection(conn)
     
     def get_test_message(self, guild_id):
         conn = self._get_connection()
-
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
                     "SELECT test_message FROM guild_messages WHERE guild_id = %s",
                     (guild_id,)
                 )
-
                 result = cursor.fetchone()
                 return result[0] if result else None
-            
         except Exception as e:
             print(f"❌ Hiba a test_message lekérése során: {e}")
             return None
@@ -167,18 +307,17 @@ class DatabaseManager:
     
     def insert_or_update_message(self, guild_id, test_message):
         conn = self._get_connection()
-
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    INSERT INTO guild_messages (guild_id, test_message) 
-                    VALUES (%s, %s)
+                    INSERT INTO guild_messages (guild_id, test_message, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT (guild_id) 
                     DO UPDATE SET 
-                        test_message = EXCLUDED.test_message
+                        test_message = EXCLUDED.test_message,
+                        updated_at = CURRENT_TIMESTAMP
                 """, (guild_id, test_message))
                 conn.commit()
-
             return True
         except Exception as e:
             print(f"❌ Hiba az adatok mentése során: {e}")
