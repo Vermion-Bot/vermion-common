@@ -76,6 +76,13 @@ class DatabaseManager:
                 UNIQUE(user_id, guild_id)
             );
             
+            CREATE TABLE IF NOT EXISTS bot_guilds (
+                guild_id BIGINT PRIMARY KEY,
+                guild_name VARCHAR(255),
+                member_count INTEGER DEFAULT 0,
+                synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
@@ -218,24 +225,109 @@ class DatabaseManager:
         finally:
             self._return_connection(conn)
     
+    def sync_bot_guilds(self, guilds_data):
+        """Frissíti a bot_guilds táblát a bot által látott szerverekkel"""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM bot_guilds")
+                
+                for guild in guilds_data:
+                    cursor.execute("""
+                        INSERT INTO bot_guilds (guild_id, guild_name, member_count)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (guild_id) DO UPDATE SET
+                            guild_name = EXCLUDED.guild_name,
+                            member_count = EXCLUDED.member_count,
+                            synced_at = CURRENT_TIMESTAMP
+                    """, (
+                        guild['id'],
+                        guild['name'],
+                        guild.get('member_count', 0)
+                    ))
+                
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"❌ Hiba a bot guilds szinkronizálása során: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        finally:
+            self._return_connection(conn)
+    
+    def add_bot_guild(self, guild_id, guild_name, member_count=0):
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO bot_guilds (guild_id, guild_name, member_count)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (guild_id) DO UPDATE SET
+                        guild_name = EXCLUDED.guild_name,
+                        member_count = EXCLUDED.member_count,
+                        synced_at = CURRENT_TIMESTAMP
+                """, (guild_id, guild_name, member_count))
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"❌ Hiba a bot guild hozzáadása során: {e}")
+            return False
+        finally:
+            self._return_connection(conn)
+    
+    def remove_bot_guild(self, guild_id):
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM bot_guilds WHERE guild_id = %s", (guild_id,))
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"❌ Hiba a bot guild törlése során: {e}")
+            return False
+        finally:
+            self._return_connection(conn)
+    
+    def is_bot_in_guild(self, guild_id):
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT EXISTS(SELECT 1 FROM bot_guilds WHERE guild_id = %s)
+                """, (guild_id,))
+                result = cursor.fetchone()
+                return result[0] if result else False
+        except Exception as e:
+            print(f"❌ Hiba a bot guild ellenőrzés során: {e}")
+            return False
+        finally:
+            self._return_connection(conn)
+    
     def get_user_guilds(self, user_id, manageable_only=True):
         conn = self._get_connection()
         try:
             with conn.cursor() as cursor:
                 if manageable_only:
+                    # ADMINISTRATOR perm check (0x8 = 8) ÉS bot jelenlét
                     cursor.execute("""
-                        SELECT guild_id, guild_name, guild_icon, owner, permissions
-                        FROM user_guilds 
-                        WHERE user_id = %s 
-                        AND (owner = TRUE OR (permissions & 32) = 32)
-                        ORDER BY guild_name
+                        SELECT ug.guild_id, ug.guild_name, ug.guild_icon, ug.owner, ug.permissions,
+                               CASE WHEN bg.guild_id IS NOT NULL THEN TRUE ELSE FALSE END as bot_present
+                        FROM user_guilds ug
+                        LEFT JOIN bot_guilds bg ON ug.guild_id = bg.guild_id
+                        WHERE ug.user_id = %s 
+                        AND (ug.owner = TRUE OR (ug.permissions & 8) = 8)
+                        AND bg.guild_id IS NOT NULL
+                        ORDER BY ug.guild_name
                     """, (user_id,))
                 else:
                     cursor.execute("""
-                        SELECT guild_id, guild_name, guild_icon, owner, permissions
-                        FROM user_guilds 
-                        WHERE user_id = %s
-                        ORDER BY guild_name
+                        SELECT ug.guild_id, ug.guild_name, ug.guild_icon, ug.owner, ug.permissions,
+                               CASE WHEN bg.guild_id IS NOT NULL THEN TRUE ELSE FALSE END as bot_present
+                        FROM user_guilds ug
+                        LEFT JOIN bot_guilds bg ON ug.guild_id = bg.guild_id
+                        WHERE ug.user_id = %s
+                        ORDER BY ug.guild_name
                     """, (user_id,))
                 
                 results = cursor.fetchall()
@@ -244,7 +336,8 @@ class DatabaseManager:
                     'guild_name': r[1],
                     'guild_icon': r[2],
                     'owner': r[3],
-                    'permissions': r[4]
+                    'permissions': r[4],
+                    'bot_present': r[5]
                 } for r in results]
         except Exception as e:
             print(f"❌ Hiba a guilds lekérése során: {e}")
@@ -265,7 +358,8 @@ class DatabaseManager:
                 result = cursor.fetchone()
                 if result:
                     owner, permissions = result
-                    return owner or (permissions & 32) == 32
+                    # ADMINISTRATOR perm check (0x8 = 8)
+                    return owner or (permissions & 8) == 8
                 return False
         except Exception as e:
             print(f"❌ Hiba a permission ellenőrzés során: {e}")
