@@ -404,17 +404,37 @@ class DatabaseManager:
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    INSERT INTO guild_messages (guild_id, test_message, updated_at) 
-                    VALUES (%s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (guild_id) 
-                    DO UPDATE SET 
-                        test_message = EXCLUDED.test_message,
-                        updated_at = CURRENT_TIMESTAMP
-                """, (guild_id, test_message))
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'guild_messages' AND column_name = 'updated_at'
+                """)
+            
+                has_updated_at = bool(cursor.fetchone())
+            
+                if has_updated_at:
+                    cursor.execute("""
+                        INSERT INTO guild_messages (guild_id, test_message, updated_at) 
+                        VALUES (%s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (guild_id) 
+                        DO UPDATE SET 
+                            test_message = EXCLUDED.test_message,
+                            updated_at = CURRENT_TIMESTAMP
+                    """, (guild_id, test_message))
+                else:
+                    cursor.execute("""
+                        INSERT INTO guild_messages (guild_id, test_message) 
+                        VALUES (%s, %s)
+                        ON CONFLICT (guild_id) 
+                        DO UPDATE SET 
+                            test_message = EXCLUDED.test_message
+                    """, (guild_id, test_message))
+            
                 conn.commit()
-            return True
+                return True
         except Exception as e:
             print(f"❌ Hiba az adatok mentése során: {e}")
+            import traceback
+            traceback.print_exc()
             return False
         finally:
             self._return_connection(conn)
