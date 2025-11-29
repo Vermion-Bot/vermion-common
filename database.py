@@ -82,6 +82,13 @@ class DatabaseManager:
                 member_count INTEGER DEFAULT 0,
                 synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS automod_settings (
+                guild_id BIGINT PRIMARY KEY,
+                settings JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
             
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id SERIAL PRIMARY KEY,
@@ -398,6 +405,65 @@ class DatabaseManager:
             return None
         finally:
             self._return_connection(conn)
+
+
+    def get_automod_settings(self, guild_id):
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT settings FROM automod_settings 
+                    WHERE guild_id = %s
+                """, (guild_id,))
+            
+                result = cursor.fetchone()
+                if result and result[0]:
+                    import json
+                    
+                    if isinstance(result[0], str):
+                        return json.loads(result[0])
+                    else:
+                        return result[0] 
+                return None
+        except Exception as e:
+            print(f"❌ Hiba az automod beállítások lekérése során: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        finally:
+            self._return_connection(conn)
+
+    def save_automod_settings(self, guild_id, settings):
+        """Automod beállítások mentése"""
+        conn = self._get_connection()
+        try:
+            import json
+            
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO automod_settings (guild_id, settings, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (guild_id) 
+                    DO UPDATE SET 
+                        settings = EXCLUDED.settings,
+                        updated_at = NOW()
+                    RETURNING guild_id
+                """, (guild_id, json.dumps(settings)))
+            
+                conn.commit()
+                result = cursor.fetchone()
+                print(f"✅ Automod beállítások mentve: {result}")  
+                return True
+        except Exception as e:
+            print(f"❌ Hiba az automod beállítások mentése során: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        finally:
+            self._return_connection(conn)
+    
+    
+    
     
     def insert_or_update_message(self, guild_id, test_message):
         conn = self._get_connection()
